@@ -19,7 +19,15 @@ const hits = new Map<string, number[]>();
 
 function rateLimited(ip: string) {
   const now = Date.now();
-  const recent = (hits.get(ip) ?? []).filter((t) => now - t < WINDOW_MS);
+  // Sweep every IP, not just this one — otherwise an entry for an IP that
+  // never comes back sits in the map forever and the process slowly leaks
+  // memory until it's killed for exceeding its limit.
+  for (const [key, timestamps] of hits) {
+    const recent = timestamps.filter((t) => now - t < WINDOW_MS);
+    if (recent.length === 0) hits.delete(key);
+    else hits.set(key, recent);
+  }
+  const recent = hits.get(ip) ?? [];
   recent.push(now);
   hits.set(ip, recent);
   return recent.length > MAX_REQUESTS;
