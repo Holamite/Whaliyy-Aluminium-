@@ -119,16 +119,20 @@ function smtpConfig() {
 }
 
 /**
- * Koyeb's edge appends the IP it actually accepted the connection from to
- * the end of x-forwarded-for — per their docs, that's "the only IP we can
- * certify as valid." A client can prepend whatever fake entries it likes
- * before that, so the first value (what this used to read) is attacker-
- * controlled and trivially bypasses the limiter below. This is still only
- * an anti-abuse heuristic, not a security boundary: it resets on restart
- * and isn't shared across instances if this ever scales beyond one.
- * https://www.koyeb.com/docs/reference/edge-network
+ * Render routes public traffic through Cloudflare in front of its own edge,
+ * so a request here has already passed through two hops, not one.
+ * cf-connecting-ip is the value Cloudflare's edge itself observed the
+ * connection from and overwrites on every request regardless of what the
+ * client sent — Render's own docs point to it as the trustworthy source:
+ * https://community.render.com/t/accessing-client-ips-in-a-node-express-app/36282
+ * x-forwarded-for is kept only as a fallback (its rightmost entry, since a
+ * client can still prepend fake values before any hop it doesn't control).
+ * Either way this is an anti-abuse heuristic, not a security boundary: it's
+ * per-instance, in-memory, and resets on restart.
  */
 function clientIp(req: NextRequest): string {
+  const cfIp = req.headers.get("cf-connecting-ip")?.trim();
+  if (cfIp) return cfIp;
   const chain = req.headers.get("x-forwarded-for");
   if (!chain) return "unknown";
   const parts = chain.split(",").map((p) => p.trim()).filter(Boolean);

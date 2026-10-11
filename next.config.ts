@@ -9,14 +9,21 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   images: {
-    formats: ["image/avif", "image/webp"],
-    // Source photos top out around 1800px wide, so the default device list
-    // (up to 3840px) just makes the server-side resizer generate and cache
-    // extra oversized variants it will never serve — wasted memory on every
-    // unique image. Match the sizes this site actually renders.
-    deviceSizes: [640, 828, 1080, 1350, 1920],
-    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384],
-    minimumCacheTTL: 60 * 60 * 24 * 30,
+    // Root cause of the Render OOM restarts: the sharp-based optimizer
+    // (/_next/image) has no concurrency cap. Measured locally — a burst of
+    // just 30 first-time image requests (the kind a fresh deploy's cold
+    // cache sees from the first few visitors on different screen widths, or
+    // an image-crawling bot) pushed RSS from ~43MB to 270MB, reproducibly,
+    // regardless of output format (WebP or AVIF). The same site's actual
+    // source photos are already small (largest is ~260KB, 1800px wide), so
+    // serving them unoptimized and letting the browser cache them directly
+    // is both cheap and good enough: the same 512MB instance held flat at
+    // baseline RSS under 150 concurrent static-file requests — more than
+    // 5x the load that spiked the optimizer. <Image> still gives lazy
+    // loading, blur placeholders, and layout stability; it just stops
+    // resizing/re-encoding on the server. Revisit if this moves to a larger
+    // instance or a CDN that can absorb that work off this process.
+    unoptimized: true,
   },
   async headers() {
     return [{ source: "/(.*)", headers: securityHeaders }];
