@@ -1,7 +1,11 @@
 import nodemailer from "nodemailer";
 import { NextResponse, type NextRequest } from "next/server";
 import { business } from "@/content/site";
-import { quoteSummary, serviceLabel, validateFiles, validateQuote, type QuoteFields } from "@/lib/quote";
+import { FILE_RULES, quoteSummary, serviceLabel, validateFiles, validateQuote, type QuoteFields } from "@/lib/quote";
+
+// Generous allowance on top of the file-size cap for the text fields and
+// multipart boundaries/headers that come with them.
+const MAX_BODY_BYTES = FILE_RULES.maxBytesTotal + 64 * 1024;
 
 export const runtime = "nodejs";
 
@@ -12,25 +16,90 @@ export const runtime = "nodejs";
  * Submissions are not stored on the server and attachments are only forwarded by email.
  */
 
-// Basic in-memory rate limit: 5 requests per 10 minutes per IP (per server instance).
+// Basic in-memory rate limit: 5 requests per 10 minutes per IP (per server
+// instance). A fixed-window counter — not a growing timestamp array — so a
+// single IP hammering the endpoint holds one small object, not an
+// ever-growing array, and a full map sweep only runs once a minute instead
+// of on every request.
 const WINDOW_MS = 10 * 60 * 1000;
 const MAX_REQUESTS = 5;
-const hits = new Map<string, number[]>();
+const SWEEP_INTERVAL_MS = 60 * 1000;
+const MAX_TRACKED_IPS = 5000;
 
-function rateLimited(ip: string) {
-  const now = Date.now();
-  // Sweep every IP, not just this one — otherwise an entry for an IP that
-  // never comes back sits in the map forever and the process slowly leaks
-  // memory until it's killed for exceeding its limit.
-  for (const [key, timestamps] of hits) {
-    const recent = timestamps.filter((t) => now - t < WINDOW_MS);
-    if (recent.length === 0) hits.delete(key);
-    else hits.set(key, recent);
+type Bucket = { count: number; windowStart: number };
+const hits = new Map<string, Bucket>();
+let lastSweep = Date.now();
+
+function sweepExpired(now: number) {
+  for (const [key, bucket] of hits) {
+    if (now - bucket.windowStart >= WINDOW_MS) hits.delete(key);
   }
-  const recent = hits.get(ip) ?? [];
-  recent.push(now);
-  hits.set(ip, recent);
-  return recent.length > MAX_REQUESTS;
+  lastSweep = now;
+}
+
+function rateLimited(ip: string): boolean {
+  const now = Date.now();
+  if (now - lastSweep >= SWEEP_INTERVAL_MS) sweepExpired(now);
+
+  const bucket = hits.get(ip);
+  const expired = !bucket || now - bucket.windowStart >= WINDOW_MS;
+
+  if (expired) {
+    // Hard cap on distinct IPs tracked at once, so a flood of unique IPs
+    // can't grow the map faster than the periodic sweep clears it. Evicts
+    // the oldest-inserted entry, which Map iteration order gives us for free.
+    if (!bucket && hits.size >= MAX_TRACKED_IPS) {
+      const oldestKey = hits.keys().next().value;
+      if (oldestKey !== undefined) hits.delete(oldestKey);
+    }
+    hits.set(ip, { count: 1, windowStart: now });
+    return false;
+  }
+
+  // Already at the cap for this window — reject without growing the bucket
+  // further, so a sustained flood from one IP can't inflate its own entry.
+  if (bucket.count >= MAX_REQUESTS) return true;
+
+  bucket.count += 1;
+  return false;
+}
+
+// Caps how many requests can be buffering attachments into memory at once,
+// so a burst of large, concurrent submissions can't multiply peak memory
+// usage (each one holds up to ~12MB of attachment data, and more while
+// nodemailer re-encodes it). Start conservative on a small instance; raise
+// this only after measuring actual memory headroom under real traffic.
+const MAX_CONCURRENT_SUBMISSIONS = 2;
+let inFlightSubmissions = 0;
+
+/**
+ * Content-Length is only a declared value — a client can omit it or send a
+ * chunked body with no length at all, bypassing a header-only check. This
+ * enforces the cap on the real byte stream as it arrives, so the request is
+ * aborted before formData() can buffer an oversized body into memory.
+ *
+ * formData() may wrap or replace the stream error it catches internally, so
+ * the caller can't reliably tell "oversized" apart from "malformed" by
+ * inspecting whatever error comes out the other end. Instead, `onExceeded`
+ * fires at the exact moment the limit is crossed, giving the caller a
+ * side-channel signal that doesn't depend on error identity surviving the
+ * trip through formData()'s parser.
+ */
+function capBodySize(body: ReadableStream<Uint8Array>, maxBytes: number, onExceeded: () => void): ReadableStream<Uint8Array> {
+  let total = 0;
+  return body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        total += chunk.byteLength;
+        if (total > maxBytes) {
+          onExceeded();
+          controller.error(new Error("PAYLOAD_TOO_LARGE"));
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+    }),
+  );
 }
 
 const escapeHtml = (s: string) =>
@@ -49,8 +118,25 @@ function smtpConfig() {
   };
 }
 
+/**
+ * Koyeb's edge appends the IP it actually accepted the connection from to
+ * the end of x-forwarded-for — per their docs, that's "the only IP we can
+ * certify as valid." A client can prepend whatever fake entries it likes
+ * before that, so the first value (what this used to read) is attacker-
+ * controlled and trivially bypasses the limiter below. This is still only
+ * an anti-abuse heuristic, not a security boundary: it resets on restart
+ * and isn't shared across instances if this ever scales beyond one.
+ * https://www.koyeb.com/docs/reference/edge-network
+ */
+function clientIp(req: NextRequest): string {
+  const chain = req.headers.get("x-forwarded-for");
+  if (!chain) return "unknown";
+  const parts = chain.split(",").map((p) => p.trim()).filter(Boolean);
+  return parts[parts.length - 1] || "unknown";
+}
+
 export async function POST(req: NextRequest) {
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  const ip = clientIp(req);
   if (rateLimited(ip)) {
     return NextResponse.json(
       { ok: false, code: "RATE_LIMITED", message: "Too many requests. Please wait a few minutes or contact us on WhatsApp." },
@@ -58,86 +144,117 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  let form: FormData;
-  try {
-    form = await req.formData();
-  } catch {
-    return NextResponse.json({ ok: false, code: "BAD_REQUEST", message: "The form data could not be read." }, { status: 400 });
-  }
-
-  // Honeypot: real visitors never fill this hidden field.
-  if (String(form.get("website") ?? "").trim()) {
-    return NextResponse.json({ ok: true });
-  }
-
-  const str = (k: string) => String(form.get(k) ?? "").trim();
-  const fields: QuoteFields = {
-    fullName: str("fullName"),
-    phone: str("phone"),
-    email: str("email"),
-    service: str("service"),
-    location: str("location"),
-    description: str("description"),
-    dimensions: str("dimensions"),
-    preferredContact: str("preferredContact"),
-    budget: str("budget"),
-    consent: form.get("consent") === "yes",
-  };
-
-  const files = form.getAll("files").filter((f): f is File => typeof f === "object" && f !== null && "arrayBuffer" in f && f.size > 0);
-  const errors = validateQuote(fields);
-  const fileError = validateFiles(files);
-  if (fileError) errors.files = fileError;
-  if (Object.keys(errors).length) {
-    return NextResponse.json({ ok: false, code: "VALIDATION", errors }, { status: 422 });
-  }
-
-  const smtp = smtpConfig();
-  if (!smtp) {
+  // Fast rejection when the header is present and honest — avoids opening
+  // the body stream at all for the common case.
+  const contentLength = Number(req.headers.get("content-length") ?? 0);
+  if (contentLength > MAX_BODY_BYTES) {
     return NextResponse.json(
-      { ok: false, code: "NOT_CONFIGURED", message: "Online quote requests aren't switched on yet." },
+      { ok: false, code: "PAYLOAD_TOO_LARGE", message: "Attachments must be 12 MB or less in total." },
+      { status: 413 },
+    );
+  }
+
+  if (inFlightSubmissions >= MAX_CONCURRENT_SUBMISSIONS) {
+    return NextResponse.json(
+      { ok: false, code: "SERVER_BUSY", message: "We're handling a lot of requests right now — please try again shortly." },
       { status: 503 },
     );
   }
-
-  const rows: [string, string][] = [
-    ["Name", fields.fullName],
-    ["Phone", fields.phone],
-    ["Email", fields.email || "—"],
-    ["Service", serviceLabel(fields.service)],
-    ["Project location", fields.location],
-    ["Approx. dimensions", fields.dimensions || "—"],
-    ["Budget range", fields.budget || "—"],
-    ["Preferred contact", fields.preferredContact],
-  ];
+  inFlightSubmissions += 1;
 
   try {
-    const transporter = nodemailer.createTransport({
-      host: smtp.host,
-      port: smtp.port,
-      secure: smtp.secure,
-      auth: smtp.auth,
-    });
-    await transporter.sendMail({
-      from: `"${business.name} website" <${smtp.from}>`,
-      to: smtp.to,
-      replyTo: fields.email || undefined,
-      subject: `Quote request: ${serviceLabel(fields.service)} — ${fields.fullName}`,
-      text: quoteSummary(fields),
-      html: `<h2>New quote request</h2><table cellpadding="6">${rows
-        .map(([k, v]) => `<tr><td><strong>${escapeHtml(k)}</strong></td><td>${escapeHtml(v)}</td></tr>`)
-        .join("")}</table><h3>Project details</h3><p style="white-space:pre-wrap">${escapeHtml(fields.description)}</p>`,
-      attachments: await Promise.all(
-        files.map(async (f) => ({ filename: f.name.replace(/[^\w.\- ]/g, "_"), content: Buffer.from(await f.arrayBuffer()), contentType: f.type || undefined })),
-      ),
-    });
-  } catch (err) {
-    console.error("[quote] email failed", err instanceof Error ? err.message : err);
-    return NextResponse.json(
-      { ok: false, code: "SEND_FAILED", message: "Your request couldn't be sent right now." },
-      { status: 502 },
-    );
-  }
+    let form: FormData;
+    let bodyTooLarge = false;
+    try {
+      const body = req.body ? capBodySize(req.body, MAX_BODY_BYTES, () => (bodyTooLarge = true)) : null;
+      const boundedReq = body ? new Request(req.url, { method: "POST", headers: req.headers, body, duplex: "half" } as RequestInit) : req;
+      form = await boundedReq.formData();
+    } catch {
+      if (bodyTooLarge) {
+        return NextResponse.json(
+          { ok: false, code: "PAYLOAD_TOO_LARGE", message: "Attachments must be 12 MB or less in total." },
+          { status: 413 },
+        );
+      }
+      return NextResponse.json({ ok: false, code: "BAD_REQUEST", message: "The form data could not be read." }, { status: 400 });
+    }
 
-  return NextResponse.json({ ok: true });
+    // Honeypot: real visitors never fill this hidden field.
+    if (String(form.get("website") ?? "").trim()) {
+      return NextResponse.json({ ok: true });
+    }
+
+    const str = (k: string) => String(form.get(k) ?? "").trim();
+    const fields: QuoteFields = {
+      fullName: str("fullName"),
+      phone: str("phone"),
+      email: str("email"),
+      service: str("service"),
+      location: str("location"),
+      description: str("description"),
+      dimensions: str("dimensions"),
+      preferredContact: str("preferredContact"),
+      budget: str("budget"),
+      consent: form.get("consent") === "yes",
+    };
+
+    const files = form.getAll("files").filter((f): f is File => typeof f === "object" && f !== null && "arrayBuffer" in f && f.size > 0);
+    const errors = validateQuote(fields);
+    const fileError = validateFiles(files);
+    if (fileError) errors.files = fileError;
+    if (Object.keys(errors).length) {
+      return NextResponse.json({ ok: false, code: "VALIDATION", errors }, { status: 422 });
+    }
+
+    const smtp = smtpConfig();
+    if (!smtp) {
+      return NextResponse.json(
+        { ok: false, code: "NOT_CONFIGURED", message: "Online quote requests aren't switched on yet." },
+        { status: 503 },
+      );
+    }
+
+    const rows: [string, string][] = [
+      ["Name", fields.fullName],
+      ["Phone", fields.phone],
+      ["Email", fields.email || "—"],
+      ["Service", serviceLabel(fields.service)],
+      ["Project location", fields.location],
+      ["Approx. dimensions", fields.dimensions || "—"],
+      ["Budget range", fields.budget || "—"],
+      ["Preferred contact", fields.preferredContact],
+    ];
+
+    try {
+      const transporter = nodemailer.createTransport({
+        host: smtp.host,
+        port: smtp.port,
+        secure: smtp.secure,
+        auth: smtp.auth,
+      });
+      await transporter.sendMail({
+        from: `"${business.name} website" <${smtp.from}>`,
+        to: smtp.to,
+        replyTo: fields.email || undefined,
+        subject: `Quote request: ${serviceLabel(fields.service)} — ${fields.fullName}`,
+        text: quoteSummary(fields),
+        html: `<h2>New quote request</h2><table cellpadding="6">${rows
+          .map(([k, v]) => `<tr><td><strong>${escapeHtml(k)}</strong></td><td>${escapeHtml(v)}</td></tr>`)
+          .join("")}</table><h3>Project details</h3><p style="white-space:pre-wrap">${escapeHtml(fields.description)}</p>`,
+        attachments: await Promise.all(
+          files.map(async (f) => ({ filename: f.name.replace(/[^\w.\- ]/g, "_"), content: Buffer.from(await f.arrayBuffer()), contentType: f.type || undefined })),
+        ),
+      });
+    } catch (err) {
+      console.error("[quote] email failed", err instanceof Error ? err.message : err);
+      return NextResponse.json(
+        { ok: false, code: "SEND_FAILED", message: "Your request couldn't be sent right now." },
+        { status: 502 },
+      );
+    }
+
+    return NextResponse.json({ ok: true });
+  } finally {
+    inFlightSubmissions -= 1;
+  }
 }
